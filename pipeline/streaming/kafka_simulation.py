@@ -49,8 +49,11 @@ def _order_event() -> dict[str, Any]:
     Returns:
         Dict representing one order event.
     """
+    # order_id uses a high integer range (100 M+) to avoid collision with
+    # batch-ingested orders (1 – NUM_ORDERS).  Both are integers so the
+    # nk_order_id column stays type-consistent across batch and streaming.
     return {
-        "order_id":   fake.uuid4(),
+        "order_id":    fake.random_int(min=100_000_000, max=999_999_999),
         "customer_id": fake.random_int(min=1, max=settings.NUM_CUSTOMERS),
         "product_id":  fake.random_int(min=1, max=settings.NUM_PRODUCTS),
         "quantity":    fake.random_int(min=1, max=5),
