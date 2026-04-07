@@ -48,7 +48,9 @@ def _crc32_sk(value: object) -> int:
         Positive 32-bit integer surrogate key.
     """
     crc = binascii.crc32(str(value).encode()) & 0xFFFFFFFF
-    return int(crc) or 1  # 0 is reserved as "unknown/missing"
+    # 0 is the sentinel for "unknown member" in the fact table.
+    # If CRC32 happens to produce 0, shift to 1 to keep 0 free.
+    return int(crc) if crc != 0 else 1
 
 
 def _build_sk_column(series: pd.Series, col_name: str) -> pd.Series:
@@ -235,6 +237,14 @@ def build_fato_pedidos(
     if n_orphan_prod:
         logger.warning("Orphan product keys in fato", extra={"count": n_orphan_prod})
 
+    # Build year/month map from orders BEFORE the one-to-many item join.
+    # After the join fato has more rows than orders (one row per item line),
+    # so slicing orders["year"].values[:len(fato)] would give wrong results.
+    ym_map = orders.set_index("order_id").assign(
+        year=lambda df: df["order_date"].dt.year,
+        month=lambda df: df["order_date"].dt.month,
+    )[["year", "month"]]
+
     fato = orders.merge(
         items[["order_id", "item_id", "sk_produto", "quantity", "unit_price", "discount", "line_total"]],
         on="order_id",
@@ -249,8 +259,9 @@ def build_fato_pedidos(
         "channel":      "ds_canal",
     })
 
-    fato["year"]  = orders["order_date"].dt.year.values[:len(fato)]
-    fato["month"] = orders["order_date"].dt.month.values[:len(fato)]
+    # Map year/month by nk_order_id — correct for any number of items per order.
+    fato["year"]  = fato["nk_order_id"].map(ym_map["year"])
+    fato["month"] = fato["nk_order_id"].map(ym_map["month"])
 
     # Enforce contract: all required columns must be present
     missing = [c for c in _FATO_COLS if c not in fato.columns]
