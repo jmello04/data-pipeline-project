@@ -138,7 +138,7 @@ def main() -> None:
         extra={"total_elapsed_s": round(total_elapsed, 2), "stage_timings": timings},
     )
     for stage_name, elapsed in timings.items():
-        logger.info("  %-30s %.2fs", stage_name, elapsed)
+        logger.info("Stage timing", extra={"stage": stage_name, "elapsed_s": round(elapsed, 2)})
 
 
 if __name__ == "__main__":

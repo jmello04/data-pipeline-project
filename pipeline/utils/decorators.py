@@ -68,6 +68,13 @@ def retry(
 def timed(fn: _F) -> _F:
     """Log the wall-clock execution time of a function.
 
+    Uses the decorated function's own module logger so the log record carries
+    the correct logger name and inherits any handlers (JSON file, stdout)
+    that the module configured via get_logger().  The logger is resolved at
+    call time (inside wrapper), not at decoration time, so it is always the
+    fully-configured instance even if get_logger() was called after @timed
+    was applied.
+
     Args:
         fn: Function to instrument.
 
@@ -76,19 +83,20 @@ def timed(fn: _F) -> _F:
     """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        log = logging.getLogger(fn.__module__)
         start = time.perf_counter()
         try:
             result = fn(*args, **kwargs)
             elapsed = time.perf_counter() - start
-            logging.getLogger(fn.__module__).info(
-                "%s finished in %.3fs", fn.__qualname__, elapsed,
+            log.info(
+                "finished",
                 extra={"fn": fn.__qualname__, "elapsed_s": round(elapsed, 3)},
             )
             return result
         except Exception:
             elapsed = time.perf_counter() - start
-            logging.getLogger(fn.__module__).error(
-                "%s raised after %.3fs", fn.__qualname__, elapsed,
+            log.error(
+                "raised",
                 extra={"fn": fn.__qualname__, "elapsed_s": round(elapsed, 3)},
             )
             raise
