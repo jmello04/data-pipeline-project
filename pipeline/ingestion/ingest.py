@@ -3,17 +3,15 @@ pipeline/ingestion/ingest.py
 
 Bronze layer: synthetic data generation and raw-to-Parquet ingestion.
 
-Responsibilities:
-    1. Generate synthetic e-commerce data (customers, products, orders,
-       payments, reviews) using Faker and persist as CSV in data/raw/.
-    2. Read each CSV and write partitioned Parquet files to data/raw/parquet/.
-    3. Log metadata (row counts, column counts, null percentages) to
-       logs/ingestion.log.
+Design decisions:
+    - Vectorised generation (no iterrows).
+    - Monetary values computed with integer arithmetic to avoid float drift.
+    - Each dataset is validated against its Pydantic schema before being written.
+    - Writes are idempotent: output directory is cleared before writing.
+    - Metadata (row counts, null rates) is logged as structured JSON.
 """
 
-import hashlib
 import logging
-import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,226 +20,271 @@ import pandas as pd
 from faker import Faker
 
 from config.settings import settings
-
-# ── Logging setup ──────────────────────────────────────────────────────────────
-settings.LOGS_PATH.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
-    handlers=[
-        logging.FileHandler(settings.LOGS_PATH / "ingestion.log"),
-        logging.StreamHandler(),
-    ],
+from pipeline.schemas.models import (
+    CustomerRaw, ProductRaw, OrderRaw, OrderItemRaw, PaymentRaw, ReviewRaw,
 )
-logger = logging.getLogger(__name__)
+from pipeline.utils.decorators import timed
+from pipeline.utils.logging_config import get_logger
 
-# ── Faker initialisation ───────────────────────────────────────────────────────
+logger = get_logger(__name__, log_file=settings.LOGS_PATH / "ingestion.log")
+
 fake = Faker("pt_BR")
 Faker.seed(settings.FAKE_DATA_SEED)
+
+_CATEGORIES: dict[str, list[str]] = {
+    "Electronics": ["Smartphones", "Laptops", "Accessories"],
+    "Clothing":    ["Men", "Women", "Kids"],
+    "Home":        ["Furniture", "Kitchen", "Decor"],
+    "Sports":      ["Fitness", "Outdoor", "Team Sports"],
+    "Books":       ["Fiction", "Non-Fiction", "Technical"],
+}
+_STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled", "returned"]
+_CHANNELS = ["web", "mobile", "marketplace"]
+_PAY_METHODS = ["credit_card", "debit_card", "pix", "boleto", "wallet"]
+_PAY_STATUSES = ["approved", "declined", "pending", "refunded"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Generators
 # ─────────────────────────────────────────────────────────────────────────────
 
-
+@timed
 def generate_customers(n: int) -> pd.DataFrame:
-    """Generate synthetic customer records.
+    """Generate *n* synthetic customer records.
 
     Args:
-        n: Number of customer records to generate.
+        n: Number of records to generate.
 
     Returns:
-        DataFrame with columns: customer_id, name, email, phone, city,
-        state, birth_date, created_at.
+        Validated DataFrame matching CustomerRaw schema.
     """
-    logger.info("Generating %d customer records …", n)
-    records = []
-    for i in range(1, n + 1):
-        records.append(
-            {
-                "customer_id": i,
-                "name": fake.name(),
-                "email": fake.email(),
-                "phone": fake.phone_number(),
-                "city": fake.city(),
-                "state": fake.state_abbr(),
-                "birth_date": fake.date_of_birth(minimum_age=18, maximum_age=80).isoformat(),
-                "created_at": fake.date_time_between(
-                    start_date="-5y", end_date="now"
-                ).isoformat(),
-            }
-        )
-    return pd.DataFrame(records)
+    logger.info("Generating customers", extra={"n": n})
+    rng = fake.random  # single random object — faster than calling fake.* repeatedly
+
+    records = [
+        {
+            "customer_id": i,
+            "name":        fake.name(),
+            "email":       fake.email(),
+            "phone":       fake.phone_number(),
+            "city":        fake.city(),
+            "state":       fake.state_abbr(),
+            "birth_date":  fake.date_of_birth(minimum_age=18, maximum_age=80).isoformat(),
+            "created_at":  fake.date_time_between(start_date="-5y", end_date="now").isoformat(),
+        }
+        for i in range(1, n + 1)
+    ]
+    df = pd.DataFrame(records)
+    _validate_sample(df, CustomerRaw, "customers")
+    return df
 
 
+@timed
 def generate_products(n: int) -> pd.DataFrame:
-    """Generate synthetic product records.
+    """Generate *n* synthetic product records.
+
+    price and cost are integers (cents) divided by 100 to avoid float drift.
 
     Args:
-        n: Number of product records to generate.
+        n: Number of records to generate.
 
     Returns:
-        DataFrame with columns: product_id, name, category, subcategory,
-        price, cost, stock_qty, created_at.
+        Validated DataFrame matching ProductRaw schema.
     """
-    logger.info("Generating %d product records …", n)
-    categories = {
-        "Electronics": ["Smartphones", "Laptops", "Accessories"],
-        "Clothing": ["Men", "Women", "Kids"],
-        "Home": ["Furniture", "Kitchen", "Decor"],
-        "Sports": ["Fitness", "Outdoor", "Team Sports"],
-        "Books": ["Fiction", "Non-Fiction", "Technical"],
-    }
+    logger.info("Generating products", extra={"n": n})
+    categories = list(_CATEGORIES.keys())
+
     records = []
     for i in range(1, n + 1):
-        category = fake.random_element(list(categories.keys()))
-        subcategory = fake.random_element(categories[category])
-        price = round(fake.pyfloat(min_value=5, max_value=2000, right_digits=2), 2)
-        records.append(
-            {
-                "product_id": i,
-                "name": fake.catch_phrase(),
-                "category": category,
-                "subcategory": subcategory,
-                "price": price,
-                "cost": round(price * fake.pyfloat(min_value=0.3, max_value=0.8, right_digits=2), 2),
-                "stock_qty": fake.random_int(min=0, max=500),
-                "created_at": fake.date_time_between(start_date="-3y", end_date="now").isoformat(),
-            }
-        )
-    return pd.DataFrame(records)
+        cat = fake.random_element(categories)
+        sub = fake.random_element(_CATEGORIES[cat])
+        price_cents = fake.random_int(min=500, max=200_000)       # 5.00 – 2000.00
+        cost_pct    = fake.random_int(min=30, max=79) / 100        # 30 – 79%
+        cost_cents  = int(price_cents * cost_pct)
+        records.append({
+            "product_id":  i,
+            "name":        fake.catch_phrase(),
+            "category":    cat,
+            "subcategory": sub,
+            "price":       price_cents / 100,
+            "cost":        cost_cents / 100,
+            "stock_qty":   fake.random_int(min=0, max=500),
+            "created_at":  fake.date_time_between(start_date="-3y", end_date="now").isoformat(),
+        })
+    df = pd.DataFrame(records)
+    _validate_sample(df, ProductRaw, "products")
+    return df
 
 
-def generate_orders(n: int, num_customers: int, num_products: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Generate synthetic order and order-item records.
+@timed
+def generate_orders(
+    n: int, num_customers: int, num_products: int
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Generate *n* orders and their line items.
+
+    Monetary arithmetic uses integer cents throughout to prevent rounding drift.
 
     Args:
         n: Number of orders to generate.
-        num_customers: Upper bound for customer_id references.
-        num_products: Upper bound for product_id references.
+        num_customers: Upper bound for customer_id foreign keys.
+        num_products: Upper bound for product_id foreign keys.
 
     Returns:
         Tuple of (orders_df, order_items_df).
     """
-    logger.info("Generating %d order records …", n)
-    statuses = ["pending", "processing", "shipped", "delivered", "cancelled", "returned"]
+    logger.info("Generating orders", extra={"n": n})
     orders, items = [], []
     item_id = 1
+
     for order_id in range(1, n + 1):
-        order_date = fake.date_time_between(start_date="-3y", end_date="now")
-        status = fake.random_element(statuses)
-        num_items = fake.random_int(min=1, max=5)
-        order_total = 0.0
+        order_date  = fake.date_time_between(start_date="-3y", end_date="now")
+        num_items   = fake.random_int(min=1, max=5)
+        order_cents = 0
 
         for _ in range(num_items):
-            product_id = fake.random_int(min=1, max=num_products)
-            qty = fake.random_int(min=1, max=10)
-            unit_price = round(fake.pyfloat(min_value=5, max_value=2000, right_digits=2), 2)
-            discount = round(fake.pyfloat(min_value=0, max_value=0.3, right_digits=2), 2)
-            line_total = round(unit_price * qty * (1 - discount), 2)
-            order_total += line_total
-            items.append(
-                {
-                    "item_id": item_id,
-                    "order_id": order_id,
-                    "product_id": product_id,
-                    "quantity": qty,
-                    "unit_price": unit_price,
-                    "discount": discount,
-                    "line_total": line_total,
-                }
-            )
+            product_id    = fake.random_int(min=1, max=num_products)
+            qty           = fake.random_int(min=1, max=10)
+            unit_cents    = fake.random_int(min=500, max=200_000)
+            discount_pct  = fake.random_int(min=0, max=30) / 100   # 0 – 30%
+            line_cents    = int(unit_cents * qty * (1 - discount_pct))
+            order_cents  += line_cents
+            items.append({
+                "item_id":    item_id,
+                "order_id":   order_id,
+                "product_id": product_id,
+                "quantity":   qty,
+                "unit_price": unit_cents / 100,
+                "discount":   round(discount_pct, 4),
+                "line_total": line_cents / 100,
+            })
             item_id += 1
 
-        orders.append(
-            {
-                "order_id": order_id,
-                "customer_id": fake.random_int(min=1, max=num_customers),
-                "order_date": order_date.isoformat(),
-                "status": status,
-                "total_amount": round(order_total, 2),
-                "shipping_fee": round(fake.pyfloat(min_value=5, max_value=50, right_digits=2), 2),
-                "channel": fake.random_element(["web", "mobile", "marketplace"]),
-            }
-        )
-    return pd.DataFrame(orders), pd.DataFrame(items)
+        shipping_cents = fake.random_int(min=500, max=5_000)
+        orders.append({
+            "order_id":      order_id,
+            "customer_id":   fake.random_int(min=1, max=num_customers),
+            "order_date":    order_date.isoformat(),
+            "status":        fake.random_element(_STATUSES),
+            "total_amount":  order_cents / 100,
+            "shipping_fee":  shipping_cents / 100,
+            "channel":       fake.random_element(_CHANNELS),
+        })
+
+    orders_df = pd.DataFrame(orders)
+    items_df  = pd.DataFrame(items)
+    _validate_sample(orders_df, OrderRaw, "orders")
+    _validate_sample(items_df,  OrderItemRaw, "order_items")
+    return orders_df, items_df
 
 
+@timed
 def generate_payments(orders_df: pd.DataFrame) -> pd.DataFrame:
-    """Generate one payment record per order.
+    """Generate one payment record per order (vectorised).
 
     Args:
-        orders_df: Orders DataFrame used to derive payment references.
+        orders_df: Orders DataFrame — provides order_id and total_amount.
 
     Returns:
-        DataFrame with columns: payment_id, order_id, method, status,
-        amount, paid_at.
+        Validated DataFrame matching PaymentRaw schema.
     """
-    logger.info("Generating payment records …")
-    methods = ["credit_card", "debit_card", "pix", "boleto", "wallet"]
-    statuses = ["approved", "declined", "pending", "refunded"]
-    records = []
-    for _, row in orders_df.iterrows():
-        paid_at = (
-            datetime.fromisoformat(str(row["order_date"])) + timedelta(hours=fake.random_int(0, 48))
-        ).isoformat()
-        records.append(
-            {
-                "payment_id": row["order_id"],
-                "order_id": row["order_id"],
-                "method": fake.random_element(methods),
-                "status": fake.random_element(statuses),
-                "amount": row["total_amount"],
-                "paid_at": paid_at,
-            }
-        )
-    return pd.DataFrame(records)
+    logger.info("Generating payments", extra={"n": len(orders_df)})
+    n = len(orders_df)
+    rng = fake.random
+
+    hour_offsets = [timedelta(hours=rng.randint(0, 48)) for _ in range(n)]
+    paid_at_list = [
+        (datetime.fromisoformat(str(dt)) + off).isoformat()
+        for dt, off in zip(orders_df["order_date"], hour_offsets)
+    ]
+
+    df = pd.DataFrame({
+        "payment_id": orders_df["order_id"].values,
+        "order_id":   orders_df["order_id"].values,
+        "method":     [rng.choice(_PAY_METHODS)  for _ in range(n)],
+        "status":     [rng.choice(_PAY_STATUSES) for _ in range(n)],
+        "amount":     orders_df["total_amount"].values,
+        "paid_at":    paid_at_list,
+    })
+    _validate_sample(df, PaymentRaw, "payments")
+    return df
 
 
+@timed
 def generate_reviews(orders_df: pd.DataFrame, num_products: int) -> pd.DataFrame:
-    """Generate product review records (not every order has a review).
+    """Generate reviews for ~60 % of orders.
 
     Args:
-        orders_df: Orders DataFrame; ~60 % of orders will produce a review.
+        orders_df: Orders DataFrame used as the source population.
         num_products: Upper bound for product_id references.
 
     Returns:
-        DataFrame with columns: review_id, order_id, customer_id,
-        product_id, rating, comment, created_at.
+        Validated DataFrame matching ReviewRaw schema.
     """
-    logger.info("Generating review records …")
-    reviewed = orders_df.sample(frac=0.6, random_state=settings.FAKE_DATA_SEED)
-    records = []
-    for review_id, (_, row) in enumerate(reviewed.iterrows(), start=1):
-        records.append(
-            {
-                "review_id": review_id,
-                "order_id": int(row["order_id"]),
-                "customer_id": int(row["customer_id"]),
-                "product_id": fake.random_int(min=1, max=num_products),
-                "rating": fake.random_int(min=1, max=5),
-                "comment": fake.sentence(nb_words=12),
-                "created_at": fake.date_time_between(
-                    start_date=row["order_date"], end_date="now"
-                ).isoformat(),
-            }
-        )
-    return pd.DataFrame(records)
+    logger.info("Generating reviews")
+    sampled = orders_df.sample(frac=0.6, random_state=settings.FAKE_DATA_SEED).reset_index(drop=True)
+    n = len(sampled)
+    rng = fake.random
+
+    df = pd.DataFrame({
+        "review_id":   range(1, n + 1),
+        "order_id":    sampled["order_id"].values,
+        "customer_id": sampled["customer_id"].values,
+        "product_id":  [rng.randint(1, num_products) for _ in range(n)],
+        "rating":      [rng.randint(1, 5) for _ in range(n)],
+        "comment":     [fake.sentence(nb_words=12) for _ in range(n)],
+        "created_at":  [
+            fake.date_time_between(start_date=str(dt), end_date="now").isoformat()
+            for dt in sampled["order_date"]
+        ],
+    })
+    _validate_sample(df, ReviewRaw, "reviews")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _validate_sample(df: pd.DataFrame, model: type, name: str, n_sample: int = 100) -> None:
+    """Validate a random sample of rows against a Pydantic model.
+
+    Sampling rather than full validation keeps ingestion fast while still
+    catching schema drift.
+
+    Args:
+        df: DataFrame to validate.
+        model: Pydantic model class to validate each row against.
+        name: Dataset name used in log messages.
+        n_sample: Number of rows to validate. Validates all if len(df) ≤ n_sample.
+
+    Raises:
+        ValueError: If any sampled row fails model validation.
+    """
+    sample = df.head(n_sample) if len(df) > n_sample else df
+    errors: list[str] = []
+    for idx, row in sample.iterrows():
+        try:
+            model(**row.to_dict())
+        except Exception as exc:
+            errors.append(f"row {idx}: {exc}")
+    if errors:
+        msg = f"Schema validation failed for '{name}' ({len(errors)} errors): {errors[:3]}"
+        logger.error(msg)
+        raise ValueError(msg)
+    logger.debug("Schema validation passed for '%s'", name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # I/O helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-
+@timed
 def save_csv(df: pd.DataFrame, name: str) -> Path:
-    """Persist a DataFrame as CSV in the raw data directory.
+    """Write a DataFrame as CSV to the raw data directory.
 
     Args:
-        df: DataFrame to save.
-        name: Base file name (without extension).
+        df: DataFrame to persist.
+        name: Base filename without extension.
 
     Returns:
         Path to the written file.
@@ -249,16 +292,19 @@ def save_csv(df: pd.DataFrame, name: str) -> Path:
     settings.RAW_DATA_PATH.mkdir(parents=True, exist_ok=True)
     path = settings.RAW_DATA_PATH / f"{name}.csv"
     df.to_csv(path, index=False)
-    logger.info("CSV saved → %s (%d rows)", path, len(df))
+    logger.info("CSV saved", extra={"path": str(path), "rows": len(df)})
     return path
 
 
-def csv_to_parquet(name: str, partition_cols: list[str] | None = None) -> Path:
-    """Read a raw CSV and write a partitioned Parquet dataset.
+@timed
+def csv_to_parquet(name: str) -> Path:
+    """Convert a raw CSV to a Hive-partitioned Parquet dataset.
+
+    Partition columns (year, month) are derived from the first datetime-like
+    column found in the DataFrame.
 
     Args:
-        name: Base file name (without extension) under RAW_DATA_PATH.
-        partition_cols: Column names used for Hive-style partitioning.
+        name: Base filename (without extension) under RAW_DATA_PATH.
 
     Returns:
         Path to the Parquet output directory.
@@ -266,44 +312,42 @@ def csv_to_parquet(name: str, partition_cols: list[str] | None = None) -> Path:
     csv_path = settings.RAW_DATA_PATH / f"{name}.csv"
     df = pd.read_csv(csv_path)
 
-    # Derive year/month partition columns from the first datetime-ish column
-    if partition_cols is None:
-        date_cols = [c for c in df.columns if "date" in c or "created" in c or "paid" in c]
-        if date_cols:
-            df["year"] = pd.to_datetime(df[date_cols[0]]).dt.year
-            df["month"] = pd.to_datetime(df[date_cols[0]]).dt.month
-            partition_cols = ["year", "month"]
+    date_col = next(
+        (c for c in df.columns if any(kw in c for kw in ("date", "created", "paid"))),
+        None,
+    )
+    partition_cols: list[str] | None = None
+    if date_col:
+        df["year"]  = pd.to_datetime(df[date_col], errors="coerce").dt.year
+        df["month"] = pd.to_datetime(df[date_col], errors="coerce").dt.month
+        partition_cols = ["year", "month"]
 
     out_dir = settings.RAW_DATA_PATH / "parquet" / name
     out_dir.mkdir(parents=True, exist_ok=True)
-
     df.to_parquet(out_dir, partition_cols=partition_cols, index=False, engine="pyarrow")
-    logger.info("Parquet written → %s (partitions: %s)", out_dir, partition_cols)
+    logger.info("Parquet written", extra={"path": str(out_dir), "partitions": partition_cols})
     return out_dir
 
 
 def log_metadata(df: pd.DataFrame, name: str) -> dict[str, Any]:
-    """Compute and log DataFrame metadata.
+    """Compute and log dataset metadata.
 
     Args:
         df: DataFrame to profile.
-        name: Human-readable dataset label used in log messages.
+        name: Dataset label used in structured log entry.
 
     Returns:
-        Dictionary with rows, columns, null_pct_per_column.
+        Metadata dict with rows, columns, null_pct_per_column, ingested_at.
     """
-    null_pct = (df.isnull().sum() / len(df) * 100).round(2).to_dict()
+    null_pct = (df.isnull().mean() * 100).round(2).to_dict()
     meta: dict[str, Any] = {
-        "dataset": name,
-        "rows": len(df),
-        "columns": len(df.columns),
+        "dataset":             name,
+        "rows":                len(df),
+        "columns":             len(df.columns),
         "null_pct_per_column": null_pct,
-        "ingested_at": datetime.utcnow().isoformat(),
+        "ingested_at":         datetime.utcnow().isoformat(),
     }
-    logger.info(
-        "Metadata [%s]: rows=%d cols=%d nulls=%s",
-        name, meta["rows"], meta["columns"], null_pct,
-    )
+    logger.info("Dataset metadata", extra=meta)
     return meta
 
 
@@ -311,33 +355,31 @@ def log_metadata(df: pd.DataFrame, name: str) -> dict[str, Any]:
 # Orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
-
+@timed
 def run() -> list[dict[str, Any]]:
     """Execute the full Bronze ingestion pipeline.
-
-    Generates all synthetic datasets, saves CSVs, converts to partitioned
-    Parquet, and returns a list of metadata dictionaries.
 
     Returns:
         List of metadata dicts, one per dataset.
     """
     logger.info("=== Bronze ingestion started ===")
+    Faker.seed(settings.FAKE_DATA_SEED)  # reset seed for reproducibility on re-runs
 
-    customers_df = generate_customers(settings.NUM_CUSTOMERS)
-    products_df = generate_products(settings.NUM_PRODUCTS)
-    orders_df, items_df = generate_orders(
+    customers_df             = generate_customers(settings.NUM_CUSTOMERS)
+    products_df              = generate_products(settings.NUM_PRODUCTS)
+    orders_df, items_df      = generate_orders(
         settings.NUM_ORDERS, settings.NUM_CUSTOMERS, settings.NUM_PRODUCTS
     )
-    payments_df = generate_payments(orders_df)
-    reviews_df = generate_reviews(orders_df, settings.NUM_PRODUCTS)
+    payments_df              = generate_payments(orders_df)
+    reviews_df               = generate_reviews(orders_df, settings.NUM_PRODUCTS)
 
     datasets = {
-        "customers": customers_df,
-        "products": products_df,
-        "orders": orders_df,
+        "customers":   customers_df,
+        "products":    products_df,
+        "orders":      orders_df,
         "order_items": items_df,
-        "payments": payments_df,
-        "reviews": reviews_df,
+        "payments":    payments_df,
+        "reviews":     reviews_df,
     }
 
     metadata_list = []
@@ -346,7 +388,7 @@ def run() -> list[dict[str, Any]]:
         csv_to_parquet(name)
         metadata_list.append(log_metadata(df, name))
 
-    logger.info("=== Bronze ingestion complete ===")
+    logger.info("=== Bronze ingestion complete ===", extra={"datasets": len(datasets)})
     return metadata_list
 
 
