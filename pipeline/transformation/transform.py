@@ -147,11 +147,13 @@ _PAYMENTS_SCHEMA = StructType([
 ])
 
 _REVIEWS_SCHEMA = StructType([
-    StructField("review_id",  LongType(),    nullable=False),
-    StructField("order_id",   LongType(),    nullable=False),
-    StructField("customer_id",StringType(), nullable=False),  # HMAC-hashed
-    StructField("product_id", LongType(),   nullable=False),
-    StructField("rating",     IntegerType(), nullable=True),
+    StructField("review_id",   LongType(),    nullable=False),
+    StructField("order_id",    LongType(),    nullable=False),
+    StructField("customer_id", StringType(),  nullable=False),  # HMAC-hashed
+    StructField("product_id",  LongType(),    nullable=False),
+    StructField("rating",      IntegerType(), nullable=True),
+    StructField("comment",     StringType(),  nullable=True),
+    StructField("created_at",  StringType(),  nullable=True),
 ])
 
 
