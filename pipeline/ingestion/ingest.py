@@ -59,8 +59,6 @@ def generate_customers(n: int) -> pd.DataFrame:
         Validated DataFrame matching CustomerRaw schema.
     """
     logger.info("Generating customers", extra={"n": n})
-    rng = fake.random  # single random object — faster than calling fake.* repeatedly
-
     records = [
         {
             "customer_id": i,
@@ -245,33 +243,57 @@ def generate_reviews(orders_df: pd.DataFrame, num_products: int) -> pd.DataFrame
 # Validation helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _validate_sample(df: pd.DataFrame, model: type, name: str, n_sample: int = 100) -> None:
+def _validate_sample(df: pd.DataFrame, model: type, name: str, n_sample: int = 200) -> None:
     """Validate a random sample of rows against a Pydantic model.
 
-    Sampling rather than full validation keeps ingestion fast while still
-    catching schema drift.
+    Uses random (not head) sampling so errors that only appear in the middle
+    or end of the dataset are caught proportionally.  Full validation is run
+    when len(df) ≤ n_sample.
 
     Args:
         df: DataFrame to validate.
         model: Pydantic model class to validate each row against.
         name: Dataset name used in log messages.
-        n_sample: Number of rows to validate. Validates all if len(df) ≤ n_sample.
+        n_sample: Number of rows to validate randomly.
 
     Raises:
-        ValueError: If any sampled row fails model validation.
+        ValueError: If any sampled row fails model validation, with full details
+            for the first three failures.
     """
-    sample = df.head(n_sample) if len(df) > n_sample else df
+    if df.empty:
+        logger.warning("Empty DataFrame passed to _validate_sample", extra={"dataset": name})
+        return
+
+    sample = (
+        df.sample(n=min(n_sample, len(df)), random_state=settings.FAKE_DATA_SEED)
+        if len(df) > n_sample
+        else df
+    )
+
+    from pydantic import ValidationError
+
     errors: list[str] = []
     for idx, row in sample.iterrows():
         try:
             model(**row.to_dict())
+        except ValidationError as exc:
+            errors.append(f"row {idx}: {exc.error_count()} validation error(s) — {exc.errors()[0]}")
         except Exception as exc:
-            errors.append(f"row {idx}: {exc}")
+            errors.append(f"row {idx}: unexpected error — {exc}")
+
     if errors:
-        msg = f"Schema validation failed for '{name}' ({len(errors)} errors): {errors[:3]}"
-        logger.error(msg)
+        msg = (
+            f"Schema validation failed for '{name}': "
+            f"{len(errors)}/{len(sample)} sampled rows invalid. "
+            f"First failures: {errors[:3]}"
+        )
+        logger.error(msg, extra={"dataset": name, "failures": len(errors), "sample_size": len(sample)})
         raise ValueError(msg)
-    logger.debug("Schema validation passed for '%s'", name)
+
+    logger.debug(
+        "Schema validation passed",
+        extra={"dataset": name, "sample_size": len(sample)},
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
