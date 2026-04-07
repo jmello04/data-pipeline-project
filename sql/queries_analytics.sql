@@ -1,71 +1,71 @@
 -- =============================================================================
 -- queries_analytics.sql
--- Analytical queries against the data warehouse star schema
+-- Queries analíticas sobre o esquema estrela do data warehouse
 -- =============================================================================
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Q1: Monthly revenue by category (delivered orders only)
--- Returns: year, month, category, revenue, order_count, avg_ticket
+-- Q1: Receita mensal por categoria (somente pedidos entregues)
+-- Retorna: ano, mês, categoria, receita, quantidade de pedidos, ticket médio
 -- ─────────────────────────────────────────────────────────────────────────────
 SELECT
-    t.ano                                           AS year,
-    t.mes                                           AS month,
-    p.category,
-    SUM(f.line_total)                               AS revenue,
-    COUNT(DISTINCT f.nk_order_id)                   AS order_count,
+    t.ano                                           AS ano,
+    t.mes                                           AS mes,
+    p.category                                      AS categoria,
+    SUM(f.line_total)                               AS receita,
+    COUNT(DISTINCT f.nk_order_id)                   AS qtd_pedidos,
     ROUND(SUM(f.line_total) / NULLIF(COUNT(DISTINCT f.nk_order_id), 0), 2)
-                                                    AS avg_ticket
+                                                    AS ticket_medio
 FROM       dw.fato_pedidos   f
 JOIN       dw.dim_tempo      t ON t.sk_tempo  = f.sk_tempo
 JOIN       dw.dim_produtos   p ON p.sk_produto = f.sk_produto
 WHERE      f.ds_status = 'delivered'
 GROUP BY   t.ano, t.mes, p.category
-ORDER BY   t.ano, t.mes, revenue DESC;
+ORDER BY   t.ano, t.mes, receita DESC;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Q2: Top 20 best-selling products (by revenue, all time)
+-- Q2: Top 20 produtos mais vendidos (por receita, todo o período)
 -- ─────────────────────────────────────────────────────────────────────────────
 SELECT
     p.nk_product_id,
     p.nm_produto,
-    p.category,
-    SUM(f.quantity)    AS units_sold,
-    SUM(f.line_total)  AS total_revenue,
-    RANK() OVER (ORDER BY SUM(f.line_total) DESC) AS revenue_rank
+    p.category                                      AS categoria,
+    SUM(f.quantity)                                 AS unidades_vendidas,
+    SUM(f.line_total)                               AS receita_total,
+    RANK() OVER (ORDER BY SUM(f.line_total) DESC)   AS ranking_receita
 FROM       dw.fato_pedidos  f
 JOIN       dw.dim_produtos  p ON p.sk_produto = f.sk_produto
 WHERE      f.ds_status NOT IN ('cancelled', 'returned')
 GROUP BY   p.nk_product_id, p.nm_produto, p.category
-ORDER BY   total_revenue DESC
+ORDER BY   receita_total DESC
 LIMIT      20;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Q3: Average ticket per channel and payment method (last 12 months)
+-- Q3: Ticket médio por canal e método de pagamento (últimos 12 meses)
 -- ─────────────────────────────────────────────────────────────────────────────
 SELECT
-    f.ds_canal                                          AS channel,
-    f.method                                            AS payment_method,
-    COUNT(DISTINCT f.nk_order_id)                       AS order_count,
-    ROUND(AVG(f.vl_total_pedido), 2)                    AS avg_ticket,
-    ROUND(SUM(f.line_total), 2)                         AS total_revenue
+    f.ds_canal                                          AS canal,
+    f.method                                            AS metodo_pagamento,
+    COUNT(DISTINCT f.nk_order_id)                       AS qtd_pedidos,
+    ROUND(AVG(f.vl_total_pedido), 2)                    AS ticket_medio,
+    ROUND(SUM(f.line_total), 2)                         AS receita_total
 FROM       dw.fato_pedidos  f
 JOIN       dw.dim_tempo     t ON t.sk_tempo = f.sk_tempo
 WHERE      t.dt_data >= CURRENT_DATE - INTERVAL '12 months'
   AND      f.ds_status NOT IN ('cancelled', 'returned')
 GROUP BY   f.ds_canal, f.method
-ORDER BY   avg_ticket DESC;
+ORDER BY   ticket_medio DESC;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Q4: Customer churn indicator
--- "Churned" = placed at least one order but none in the last 90 days
+-- Q4: Indicador de churn de clientes
+-- "Churn" = realizou ao menos um pedido mas nenhum nos últimos 90 dias
 -- ─────────────────────────────────────────────────────────────────────────────
-WITH customer_last_order AS (
+WITH ultimo_pedido_cliente AS (
     SELECT
         f.sk_cliente,
-        MAX(t.dt_data) AS last_order_date
+        MAX(t.dt_data) AS dt_ultimo_pedido
     FROM   dw.fato_pedidos  f
     JOIN   dw.dim_tempo     t ON t.sk_tempo = f.sk_tempo
     WHERE  f.ds_status NOT IN ('cancelled', 'returned')
@@ -73,48 +73,48 @@ WITH customer_last_order AS (
 )
 SELECT
     c.sk_cliente,
-    c.state,
-    clo.last_order_date,
-    CURRENT_DATE - clo.last_order_date      AS days_since_last_order,
+    c.state                                             AS estado,
+    upc.dt_ultimo_pedido,
+    CURRENT_DATE - upc.dt_ultimo_pedido                 AS dias_desde_ultimo_pedido,
     CASE
-        WHEN CURRENT_DATE - clo.last_order_date > 90 THEN 'churned'
-        ELSE 'active'
-    END                                     AS churn_status
-FROM       customer_last_order  clo
-JOIN       dw.dim_clientes      c   ON c.sk_cliente = clo.sk_cliente
-ORDER BY   days_since_last_order DESC;
+        WHEN CURRENT_DATE - upc.dt_ultimo_pedido > 90 THEN 'churn'
+        ELSE 'ativo'
+    END                                                 AS status_churn
+FROM       ultimo_pedido_cliente  upc
+JOIN       dw.dim_clientes        c ON c.sk_cliente = upc.sk_cliente
+ORDER BY   dias_desde_ultimo_pedido DESC;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Q5: First-purchase cohort analysis
--- Groups customers by the month of their first order and tracks
--- how many are still purchasing each subsequent month.
+-- Q5: Análise de coorte por primeira compra
+-- Agrupa clientes pelo mês da primeira compra e acompanha
+-- quantos continuam comprando nos meses seguintes.
 -- ─────────────────────────────────────────────────────────────────────────────
-WITH first_orders AS (
+WITH primeiros_pedidos AS (
     SELECT
         f.sk_cliente,
-        MIN(t.dt_data)                                     AS first_order_date,
-        DATE_TRUNC('month', MIN(t.dt_data))                AS cohort_month
+        MIN(t.dt_data)                                     AS dt_primeiro_pedido,
+        DATE_TRUNC('month', MIN(t.dt_data))                AS mes_coorte
     FROM   dw.fato_pedidos  f
     JOIN   dw.dim_tempo     t ON t.sk_tempo = f.sk_tempo
     WHERE  f.ds_status NOT IN ('cancelled', 'returned')
     GROUP BY f.sk_cliente
 ),
-subsequent_orders AS (
+pedidos_subsequentes AS (
     SELECT
-        fo.cohort_month,
-        DATE_TRUNC('month', t.dt_data)                     AS order_month,
-        COUNT(DISTINCT f.sk_cliente)                        AS active_customers
+        pp.mes_coorte,
+        DATE_TRUNC('month', t.dt_data)                     AS mes_pedido,
+        COUNT(DISTINCT f.sk_cliente)                        AS clientes_ativos
     FROM   dw.fato_pedidos  f
-    JOIN   dw.dim_tempo     t  ON t.sk_tempo  = f.sk_tempo
-    JOIN   first_orders     fo ON fo.sk_cliente = f.sk_cliente
+    JOIN   dw.dim_tempo     t  ON t.sk_tempo   = f.sk_tempo
+    JOIN   primeiros_pedidos pp ON pp.sk_cliente = f.sk_cliente
     WHERE  f.ds_status NOT IN ('cancelled', 'returned')
-    GROUP BY fo.cohort_month, DATE_TRUNC('month', t.dt_data)
+    GROUP BY pp.mes_coorte, DATE_TRUNC('month', t.dt_data)
 )
 SELECT
-    cohort_month,
-    order_month,
-    active_customers,
-    EXTRACT(MONTH FROM AGE(order_month, cohort_month))  AS month_number
-FROM   subsequent_orders
-ORDER BY cohort_month, order_month;
+    mes_coorte,
+    mes_pedido,
+    clientes_ativos,
+    EXTRACT(MONTH FROM AGE(mes_pedido, mes_coorte))         AS numero_mes
+FROM   pedidos_subsequentes
+ORDER BY mes_coorte, mes_pedido;

@@ -1,6 +1,6 @@
 -- =============================================================================
 -- create_tables.sql
--- DDL for the e-commerce data warehouse (PostgreSQL-compatible syntax)
+-- DDL do data warehouse de e-commerce (sintaxe compatível com PostgreSQL)
 -- =============================================================================
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -9,24 +9,24 @@
 CREATE SCHEMA IF NOT EXISTS dw;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Dimension: dim_clientes
+-- Dimensão: dim_clientes
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS dw.dim_clientes (
-    sk_cliente       SERIAL          PRIMARY KEY,        -- surrogate key
-    nk_customer_id   VARCHAR(64)     NOT NULL UNIQUE,    -- SHA-256 natural key (LGPD)
+    sk_cliente       SERIAL          PRIMARY KEY,        -- chave substituta
+    nk_customer_id   VARCHAR(64)     NOT NULL UNIQUE,    -- chave natural com hash SHA-256 (LGPD)
     city             VARCHAR(100),
     state            CHAR(2),
     dt_criacao       TIMESTAMP,
-    dt_carga         TIMESTAMP       DEFAULT NOW()       -- ETL load timestamp
+    dt_carga         TIMESTAMP       DEFAULT NOW()       -- timestamp da carga ETL
 );
 
-COMMENT ON TABLE  dw.dim_clientes              IS 'Customer dimension – PII anonymised per LGPD.';
-COMMENT ON COLUMN dw.dim_clientes.nk_customer_id IS 'HMAC-SHA256 (keyed hash) of the original customer identifier — plain SHA-256 is not used because it is vulnerable to rainbow-table attacks.';
+COMMENT ON TABLE  dw.dim_clientes                IS 'Dimensão de clientes – PII anonimizado conforme LGPD.';
+COMMENT ON COLUMN dw.dim_clientes.nk_customer_id IS 'HMAC-SHA256 (hash com chave) do identificador original do cliente — SHA-256 simples não é usado por ser vulnerável a ataques de rainbow table.';
 
 CREATE INDEX IF NOT EXISTS idx_dim_clientes_state ON dw.dim_clientes (state);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Dimension: dim_produtos
+-- Dimensão: dim_produtos
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS dw.dim_produtos (
     sk_produto       SERIAL          PRIMARY KEY,
@@ -40,12 +40,12 @@ CREATE TABLE IF NOT EXISTS dw.dim_produtos (
     dt_carga         TIMESTAMP       DEFAULT NOW()
 );
 
-COMMENT ON TABLE dw.dim_produtos IS 'Product dimension including category hierarchy and margin.';
+COMMENT ON TABLE dw.dim_produtos IS 'Dimensão de produtos com hierarquia de categoria e margem calculada.';
 
 CREATE INDEX IF NOT EXISTS idx_dim_produtos_category ON dw.dim_produtos (category);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Dimension: dim_tempo
+-- Dimensão: dim_tempo
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS dw.dim_tempo (
     sk_tempo         SERIAL          PRIMARY KEY,
@@ -61,14 +61,14 @@ CREATE TABLE IF NOT EXISTS dw.dim_tempo (
     fl_fimdesemana   BOOLEAN         DEFAULT FALSE
 );
 
-COMMENT ON TABLE dw.dim_tempo IS 'Date dimension spanning the full order history range.';
+COMMENT ON TABLE dw.dim_tempo IS 'Dimensão de datas cobrindo todo o histórico de pedidos.';
 
 CREATE INDEX IF NOT EXISTS idx_dim_tempo_ano_mes ON dw.dim_tempo (ano, mes);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Fact: fato_pedidos
--- Grain: one row per order-item line
--- Partitioned by year, month (declaration only – apply at DDL level in PG 13+)
+-- Fato: fato_pedidos
+-- Grão: uma linha por item de pedido
+-- Particionado por ano e mês (declaração apenas – aplicar no DDL do PG 13+)
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS dw.fato_pedidos (
     nk_order_id       VARCHAR(50)     NOT NULL,
@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS dw.fato_pedidos (
     dt_carga          TIMESTAMP       DEFAULT NOW()
 );
 
-COMMENT ON TABLE dw.fato_pedidos IS 'Order fact – grain: one row per order-item. Partitioned by year/month.';
+COMMENT ON TABLE dw.fato_pedidos IS 'Fato de pedidos – grão: uma linha por item de pedido. Particionado por ano/mês.';
 
 CREATE INDEX IF NOT EXISTS idx_fato_pedidos_cliente  ON dw.fato_pedidos (sk_cliente);
 CREATE INDEX IF NOT EXISTS idx_fato_pedidos_produto  ON dw.fato_pedidos (sk_produto);

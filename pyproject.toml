@@ -1,7 +1,10 @@
 [project]
 name = "data-pipeline-project"
 version = "1.0.0"
-description = "End-to-end data engineering pipeline – Medallion architecture, dimensional modelling, LGPD-compliant anonymisation."
+description = "Pipeline de dados end-to-end – Arquitetura Medallion, modelagem dimensional, anonimização compatível com LGPD."
+authors = [
+    { name = "João Mello", email = "jmello04@github.com" },
+]
 requires-python = ">=3.11"
 dependencies = [
     "pandas>=2.1.0,<3.0.0",
