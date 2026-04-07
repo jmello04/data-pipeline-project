@@ -1,19 +1,24 @@
 """
 pipeline/streaming/kafka_simulation.py
 
-Streaming layer: Kafka producer/consumer simulation for real-time order events.
+Streaming layer: Kafka producer/consumer simulation.
 
-When USE_REAL_KAFKA=false (default), a Python queue is used as a stand-in so
-the module works without a live Kafka broker.  Set USE_REAL_KAFKA=true in .env
-and provide KAFKA_BOOTSTRAP_SERVERS to connect to a real cluster.
-
-Run:
-    python pipeline/streaming/kafka_simulation.py
+Design decisions:
+    - The local queue backend is encapsulated in a class with a reset()
+      method so tests can clear state between runs.
+    - Producer and consumer share a threading.Event for handshaking:
+      consumer signals "ready" before producer starts emitting.  This
+      eliminates the race where the producer drains the queue before the
+      consumer has started.
+    - JSONL output is written atomically (write to temp file → rename).
+      A crash mid-write leaves the previous file intact.
+    - Faker is re-seeded inside produce() so repeated calls are reproducible.
 """
 
 import json
 import logging
 import queue
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -23,22 +28,12 @@ from typing import Any
 from faker import Faker
 
 from config.settings import settings
+from pipeline.utils.decorators import retry
+from pipeline.utils.logging_config import get_logger
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-settings.LOGS_PATH.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
-    handlers=[
-        logging.FileHandler(settings.LOGS_PATH / "streaming.log"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, log_file=settings.LOGS_PATH / "streaming.log")
 
 fake = Faker("pt_BR")
-Faker.seed(settings.FAKE_DATA_SEED)
 
 _STREAMING_OUTPUT = settings.PROCESSED_DATA_PATH / "streaming"
 _STREAMING_OUTPUT.mkdir(parents=True, exist_ok=True)
@@ -48,147 +43,198 @@ _STREAMING_OUTPUT.mkdir(parents=True, exist_ok=True)
 # Event schema
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-def _generate_order_event() -> dict[str, Any]:
-    """Generate a single synthetic order event payload.
+def _order_event() -> dict[str, Any]:
+    """Generate a single synthetic order-event payload.
 
     Returns:
-        Dictionary representing one order event.
+        Dict representing one order event.
     """
     return {
-        "order_id": fake.uuid4(),
+        "order_id":   fake.uuid4(),
         "customer_id": fake.random_int(min=1, max=settings.NUM_CUSTOMERS),
-        "product_id": fake.random_int(min=1, max=settings.NUM_PRODUCTS),
-        "quantity": fake.random_int(min=1, max=5),
-        "unit_price": round(fake.pyfloat(min_value=10, max_value=1500, right_digits=2), 2),
-        "channel": fake.random_element(["web", "mobile", "marketplace"]),
-        "event_time": datetime.utcnow().isoformat(),
+        "product_id":  fake.random_int(min=1, max=settings.NUM_PRODUCTS),
+        "quantity":    fake.random_int(min=1, max=5),
+        "unit_price":  round(fake.random_int(min=500, max=150_000) / 100, 2),
+        "channel":     fake.random_element(["web", "mobile", "marketplace"]),
+        "event_time":  datetime.utcnow().isoformat(),
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# In-process queue backend (USE_REAL_KAFKA=false)
+# Local queue backend
 # ─────────────────────────────────────────────────────────────────────────────
 
-_local_queue: queue.Queue[str] = queue.Queue()
+class _LocalBus:
+    """Thread-safe in-process message bus backed by a queue.Queue.
 
-
-class LocalProducer:
-    """Simulated Kafka producer backed by a Python queue.
-
-    Args:
-        topic: Topic name (informational only in simulation mode).
+    Using a class (instead of a module-level queue) ensures that each
+    test or simulation run can start from a clean state by calling reset().
     """
 
-    def __init__(self, topic: str) -> None:
-        self.topic = topic
+    def __init__(self) -> None:
+        self._q: queue.Queue[str] = queue.Queue()
 
-    def send(self, payload: dict[str, Any]) -> None:
-        """Enqueue a serialised event payload.
-
-        Args:
-            payload: Event dictionary to enqueue.
-        """
-        message = json.dumps(payload)
-        _local_queue.put(message)
-        logger.debug("LocalProducer → [%s] %s", self.topic, message[:60])
-
-    def close(self) -> None:
-        """No-op for the local backend."""
-
-
-class LocalConsumer:
-    """Simulated Kafka consumer backed by a Python queue.
-
-    Args:
-        topic: Topic name (informational only in simulation mode).
-        group_id: Consumer group (informational only).
-    """
-
-    def __init__(self, topic: str, group_id: str) -> None:
-        self.topic = topic
-        self.group_id = group_id
-        self._running = False
-
-    def start(self, output_path: Path, max_messages: int | None = None) -> None:
-        """Consume messages from the local queue and persist them.
+    def put(self, payload: dict[str, Any]) -> None:
+        """Serialise and enqueue a message.
 
         Args:
-            output_path: Directory where JSONL output is written.
-            max_messages: Stop after this many messages (None = run until
-                queue is empty and producer signals done).
+            payload: Event dict to enqueue.
         """
-        self._running = True
-        records: list[dict[str, Any]] = []
-        consumed = 0
-        output_path.mkdir(parents=True, exist_ok=True)
+        self._q.put(json.dumps(payload))
 
-        logger.info("LocalConsumer started [topic=%s group=%s]", self.topic, self.group_id)
+    def get(self, timeout: float = 2.0) -> dict[str, Any] | None:
+        """Dequeue and deserialise one message.
 
-        while self._running:
+        Args:
+            timeout: Seconds to wait before returning None.
+
+        Returns:
+            Deserialised event dict, or None if the queue is empty.
+        """
+        try:
+            raw = self._q.get(timeout=timeout)
+            self._q.task_done()
+            return json.loads(raw)
+        except queue.Empty:
+            return None
+
+    def reset(self) -> None:
+        """Drain the queue (useful between test runs)."""
+        while not self._q.empty():
             try:
-                raw = _local_queue.get(timeout=2)
-                record = json.loads(raw)
-                records.append(record)
-                consumed += 1
-                logger.info("Consumed event #%d: order_id=%s", consumed, record.get("order_id"))
-                _local_queue.task_done()
-                if max_messages and consumed >= max_messages:
-                    break
+                self._q.get_nowait()
+                self._q.task_done()
             except queue.Empty:
                 break
 
-        # Persist batch
-        if records:
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-            out_file = output_path / f"stream_batch_{ts}.jsonl"
-            with out_file.open("w") as fh:
-                for r in records:
-                    fh.write(json.dumps(r) + "\n")
-            logger.info("Consumer wrote %d records → %s", len(records), out_file)
+    @property
+    def qsize(self) -> int:
+        """Current approximate queue depth."""
+        return self._q.qsize()
 
-        self._running = False
 
-    def close(self) -> None:
-        """Signal the consumer loop to stop."""
-        self._running = False
+_bus = _LocalBus()  # singleton shared between producer and consumer threads
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Real Kafka backend (USE_REAL_KAFKA=true)
+# Local producer / consumer
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _produce_local(n: int, ready: threading.Event) -> None:
+    """Produce *n* events to the local bus after consumer signals ready.
 
+    Args:
+        n: Number of events to produce.
+        ready: Event set by the consumer when it is ready to receive.
+    """
+    ready.wait(timeout=10)  # wait for consumer to start
+    logger.info("LocalProducer: consumer ready, starting", extra={"n": n})
+    Faker.seed(settings.FAKE_DATA_SEED)  # reproducible across repeated calls
+    for i in range(1, n + 1):
+        event = _order_event()
+        _bus.put(event)
+        logger.debug("Produced event %d/%d: %s", i, n, event["order_id"])
+        time.sleep(settings.STREAMING_INTERVAL_SEC)
+    logger.info("LocalProducer: finished", extra={"produced": n})
+
+
+def _consume_local(
+    output_path: Path,
+    max_messages: int,
+    ready: threading.Event,
+) -> None:
+    """Consume up to *max_messages* events and write them atomically to JSONL.
+
+    Args:
+        output_path: Directory for JSONL output files.
+        max_messages: Stop after this many messages.
+        ready: Event to set once the consumer is initialised.
+    """
+    output_path.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+
+    ready.set()  # signal producer that we are ready
+    logger.info("LocalConsumer: started, waiting for events")
+
+    consumed = 0
+    while consumed < max_messages:
+        event = _bus.get(timeout=3)
+        if event is None:
+            if consumed > 0:
+                break  # queue drained
+            continue
+        records.append(event)
+        consumed += 1
+        logger.debug("Consumed event %d/%d: %s", consumed, max_messages, event.get("order_id"))
+
+    if records:
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        out_file = output_path / f"stream_batch_{ts}.jsonl"
+        _write_jsonl_atomic(records, out_file)
+        logger.info("LocalConsumer: wrote batch", extra={"records": len(records),
+                                                          "file": str(out_file)})
+    else:
+        logger.warning("LocalConsumer: no events received")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Atomic JSONL writer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_jsonl_atomic(records: list[dict[str, Any]], out_file: Path) -> None:
+    """Write *records* to a JSONL file atomically (temp file → rename).
+
+    If the process crashes mid-write, the previous file at *out_file* is
+    unaffected.
+
+    Args:
+        records: List of dicts to serialise.
+        out_file: Target file path.
+    """
+    dir_ = out_file.parent
+    dir_.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".jsonl.tmp",
+                                     encoding="utf-8") as tmp:
+        for rec in records:
+            tmp.write(json.dumps(rec) + "\n")
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(out_file)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Real Kafka backend
+# ─────────────────────────────────────────────────────────────────────────────
+
+@retry(max_attempts=3, exceptions=(Exception,))
 def _get_real_producer() -> Any:
     """Instantiate a kafka-python KafkaProducer.
 
     Returns:
-        Configured KafkaProducer instance.
-
-    Raises:
-        ImportError: If kafka-python is not installed.
+        Configured KafkaProducer.
     """
     from kafka import KafkaProducer  # type: ignore
-
     return KafkaProducer(
         bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        acks="all",          # wait for all in-sync replicas
+        retries=3,
     )
 
 
+@retry(max_attempts=3, exceptions=(Exception,))
 def _get_real_consumer() -> Any:
     """Instantiate a kafka-python KafkaConsumer.
 
     Returns:
-        Configured KafkaConsumer instance.
+        Configured KafkaConsumer.
     """
     from kafka import KafkaConsumer  # type: ignore
-
     return KafkaConsumer(
         settings.KAFKA_TOPIC,
         bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
         group_id=settings.KAFKA_GROUP_ID,
         auto_offset_reset="earliest",
+        enable_auto_commit=True,
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         consumer_timeout_ms=5000,
     )
@@ -198,71 +244,56 @@ def _get_real_consumer() -> Any:
 # Orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
+def run() -> None:
+    """Run producer and consumer concurrently.
 
-def produce(n: int) -> None:
-    """Produce *n* synthetic order events to the configured backend.
-
-    Args:
-        n: Number of events to produce.
+    Uses a threading.Event handshake so the producer never emits before the
+    consumer is ready — eliminating the startup race condition.
     """
+    logger.info("=== Streaming started ===",
+                extra={"backend": "kafka" if settings.USE_REAL_KAFKA else "local_queue"})
+    n = settings.STREAMING_NUM_EVENTS
+
     if settings.USE_REAL_KAFKA:
+        # Real Kafka: producer and consumer run sequentially for simplicity
         producer = _get_real_producer()
-        logger.info("Real Kafka producer connected to %s", settings.KAFKA_BOOTSTRAP_SERVERS)
+        Faker.seed(settings.FAKE_DATA_SEED)
         for i in range(n):
-            event = _generate_order_event()
-            producer.send(settings.KAFKA_TOPIC, event)
-            logger.info("Produced event #%d: %s", i + 1, event["order_id"])
+            producer.send(settings.KAFKA_TOPIC, _order_event())
             time.sleep(settings.STREAMING_INTERVAL_SEC)
         producer.flush()
         producer.close()
-    else:
-        producer = LocalProducer(settings.KAFKA_TOPIC)
-        logger.info("Local queue producer started (USE_REAL_KAFKA=false)")
-        for i in range(n):
-            event = _generate_order_event()
-            producer.send(event)
-            logger.info("Produced event #%d: %s", i + 1, event["order_id"])
-            time.sleep(settings.STREAMING_INTERVAL_SEC)
-        producer.close()
 
-
-def consume() -> None:
-    """Consume events from the configured backend and persist them."""
-    if settings.USE_REAL_KAFKA:
         consumer = _get_real_consumer()
-        records: list[dict[str, Any]] = []
-        for message in consumer:
-            records.append(message.value)
-            logger.info("Consumed: %s", message.value.get("order_id"))
+        records = [msg.value for msg in consumer]
         consumer.close()
+
         if records:
             ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-            out_file = _STREAMING_OUTPUT / f"stream_batch_{ts}.jsonl"
-            with out_file.open("w") as fh:
-                for r in records:
-                    fh.write(json.dumps(r) + "\n")
-            logger.info("Real consumer wrote %d records → %s", len(records), out_file)
+            _write_jsonl_atomic(records, _STREAMING_OUTPUT / f"stream_batch_{ts}.jsonl")
     else:
-        consumer = LocalConsumer(settings.KAFKA_TOPIC, settings.KAFKA_GROUP_ID)
-        consumer.start(_STREAMING_OUTPUT, max_messages=settings.STREAMING_NUM_EVENTS)
+        _bus.reset()
+        ready = threading.Event()
 
+        producer_t = threading.Thread(
+            target=_produce_local,
+            args=(n, ready),
+            daemon=True,
+            name="LocalProducer",
+        )
+        consumer_t = threading.Thread(
+            target=_consume_local,
+            args=(_STREAMING_OUTPUT, n, ready),
+            daemon=False,
+            name="LocalConsumer",
+        )
 
-def run() -> None:
-    """Run producer and consumer concurrently in separate threads."""
-    logger.info("=== Streaming simulation started (USE_REAL_KAFKA=%s) ===", settings.USE_REAL_KAFKA)
+        consumer_t.start()
+        producer_t.start()
+        producer_t.join()
+        consumer_t.join(timeout=60)
 
-    producer_thread = threading.Thread(
-        target=produce, args=(settings.STREAMING_NUM_EVENTS,), daemon=True
-    )
-    consumer_thread = threading.Thread(target=consume, daemon=False)
-
-    consumer_thread.start()
-    producer_thread.start()
-
-    producer_thread.join()
-    consumer_thread.join(timeout=30)
-
-    logger.info("=== Streaming simulation complete ===")
+    logger.info("=== Streaming complete ===")
 
 
 if __name__ == "__main__":
