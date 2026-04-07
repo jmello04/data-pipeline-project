@@ -3,8 +3,10 @@ pipeline/utils/logging_config.py
 
 Structured JSON logging configuration.
 
-JSON logs are machine-readable and trivially queryable with tools like
-jq, CloudWatch Insights, or Datadog.  Plain-text logs go to stdout.
+When python-json-logger is installed (production), log files are written in
+JSON for machine-readable querying with jq, CloudWatch Insights, or Datadog.
+When it is absent (e.g. lightweight test environments), the file handler falls
+back to the same plain-text format used by stdout — no code change required.
 
 Usage:
     from pipeline.utils.logging_config import get_logger
@@ -15,20 +17,30 @@ Usage:
 import logging
 import sys
 from pathlib import Path
-from pythonjsonlogger import jsonlogger
+
+try:
+    from pythonjsonlogger import jsonlogger as _jsonlogger
+    _JSON_AVAILABLE = True
+except ImportError:  # graceful degradation — tests run without the package
+    _JSON_AVAILABLE = False
 
 
 def get_logger(name: str, log_file: Path | None = None, level: int = logging.INFO) -> logging.Logger:
-    """Build a logger that writes JSON to a file and plain text to stdout.
+    """Build a logger that writes to a file and plain text to stdout.
+
+    When python-json-logger is available the file handler uses JSON format.
+    When it is not available the file handler uses the same plain-text format
+    as stdout.  Either way every log call behaves identically for callers.
 
     Args:
         name: Logger name (typically __name__).
-        log_file: Optional path for the JSON log file.  Parent directory
-            is created automatically.
+        log_file: Optional path for the log file.  Parent directory is
+            created automatically.
         level: Logging level (default INFO).
 
     Returns:
-        Configured Logger instance.
+        Configured Logger instance.  A second call with the same name returns
+        the already-configured instance unchanged.
     """
     logger = logging.getLogger(name)
 
@@ -37,25 +49,36 @@ def get_logger(name: str, log_file: Path | None = None, level: int = logging.INF
 
     logger.setLevel(level)
 
-    # ── JSON file handler ────────────────────────────────────────────────
-    if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        json_formatter = jsonlogger.JsonFormatter(
-            fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%SZ",
-            rename_fields={"asctime": "ts", "levelname": "level", "name": "logger"},
-        )
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(json_formatter)
-        logger.addHandler(file_handler)
-
-    # ── Plain-text stdout handler ────────────────────────────────────────
-    console_formatter = logging.Formatter(
+    _plain_fmt = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # ── File handler (JSON when available, plain-text otherwise) ─────────
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+
+        if _JSON_AVAILABLE:
+            file_handler.setFormatter(
+                _jsonlogger.JsonFormatter(
+                    fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
+                    datefmt="%Y-%m-%dT%H:%M:%SZ",
+                    rename_fields={
+                        "asctime":   "ts",
+                        "levelname": "level",
+                        "name":      "logger",
+                    },
+                )
+            )
+        else:
+            file_handler.setFormatter(_plain_fmt)
+
+        logger.addHandler(file_handler)
+
+    # ── stdout handler (always plain-text) ───────────────────────────────
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(console_formatter)
+    console_handler.setFormatter(_plain_fmt)
     logger.addHandler(console_handler)
 
     logger.propagate = False

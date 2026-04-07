@@ -117,7 +117,7 @@ def dim_tempo() -> pd.DataFrame:
     return build_dim_tempo(date(2022, 1, 1), date(2023, 12, 31))
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module")  # module-scope avoids re-running build_fato_pedidos per test
 def fato(orders_silver, items_silver, payments_silver,
          dim_clientes, dim_produtos, dim_tempo) -> pd.DataFrame:
     return build_fato_pedidos(
@@ -229,8 +229,8 @@ class TestBuildDimProdutos:
 
 class TestBuildDimTempo:
     def test_row_count_matches_date_range(self, dim_tempo: pd.DataFrame) -> None:
-        # 2022-01-01 to 2023-12-31 = 730 days (2022 is not a leap year but 2023 is not either —
-        # 365 + 365 = 730)
+        # 2022-01-01 to 2023-12-31 inclusive.
+        # Neither 2022 nor 2023 is a leap year → 365 + 365 = 730 days.
         assert len(dim_tempo) == 730
 
     def test_all_required_columns_present(self, dim_tempo: pd.DataFrame) -> None:

@@ -22,6 +22,7 @@ Key design decisions:
 import hashlib
 import hmac
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
@@ -449,7 +450,8 @@ def run() -> None:
     logger.info("=== Silver transformation started ===")
     raw = settings.RAW_DATA_PATH
 
-    cleaners: list[tuple[str, object, pd.DataFrame]] = [
+    CleanFn = Callable[[pd.DataFrame], pd.DataFrame]
+    cleaners: list[tuple[str, CleanFn, pd.DataFrame]] = [
         ("customers",   clean_customers,   pd.read_csv(raw / "customers.csv")),
         ("products",    clean_products,    pd.read_csv(raw / "products.csv")),
         ("orders",      clean_orders,      pd.read_csv(raw / "orders.csv")),
