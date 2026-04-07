@@ -14,8 +14,11 @@ import os
 import pandas as pd
 import pytest
 
-# Inject a deterministic test key so LGPD tests are reproducible
-os.environ.setdefault("LGPD_HASH_KEY", "test-secret-key-for-unit-tests-only-abcdef")
+# Force-set a deterministic test key for LGPD tests.
+# os.environ.setdefault() would silently keep any pre-existing value, which
+# could be a production key that changes hash outputs and breaks assertions.
+# We always override so test behaviour is fully reproducible.
+os.environ["LGPD_HASH_KEY"] = "test-secret-key-for-unit-tests-only-abcdef"
 
 from pipeline.transformation.transform import _anonymise
 

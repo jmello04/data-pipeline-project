@@ -23,8 +23,8 @@ import pytest
 from hypothesis import given, settings as h_settings
 from hypothesis import strategies as st
 
-# Ensure the test LGPD key is set before importing anything that uses settings
-os.environ.setdefault("LGPD_HASH_KEY", "test-secret-key-for-unit-tests-only-abcdef")
+# Force-set — must match conftest.py so all hash assertions are consistent.
+os.environ["LGPD_HASH_KEY"] = "test-secret-key-for-unit-tests-only-abcdef"
 
 from pipeline.quality.quality_checks import (
     check_duplicates,
