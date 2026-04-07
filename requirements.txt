@@ -1,0 +1,8 @@
+pandas>=2.1.0
+pyspark>=3.5.0
+pyarrow>=14.0.0
+faker>=22.0.0
+kafka-python>=2.0.2
+pytest>=7.4.0
+jupyter>=1.0.0
+python-dotenv>=1.0.0
