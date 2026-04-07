@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS dw.dim_clientes (
 );
 
 COMMENT ON TABLE  dw.dim_clientes              IS 'Customer dimension – PII anonymised per LGPD.';
-COMMENT ON COLUMN dw.dim_clientes.nk_customer_id IS 'SHA-256 hash of the original customer identifier.';
+COMMENT ON COLUMN dw.dim_clientes.nk_customer_id IS 'HMAC-SHA256 (keyed hash) of the original customer identifier — plain SHA-256 is not used because it is vulnerable to rainbow-table attacks.';
 
 CREATE INDEX IF NOT EXISTS idx_dim_clientes_state ON dw.dim_clientes (state);
 

@@ -136,7 +136,15 @@ pytest tests/ -v
 make test
 ```
 
-The suite includes property-based tests (Hypothesis) that verify invariants across thousands of random inputs — not just the three rows in a fixture.
+The suite includes:
+- **Unit tests** covering every check function, cleaning function, and warehouse builder.
+- **Property-based tests** (Hypothesis) that verify invariants across thousands of random inputs.
+- **Regression tests** for specific bugs, e.g. the multi-item order year/month slicing bug in `build_fato_pedidos`.
+
+| Test file | What it covers |
+|---|---|
+| `tests/test_quality.py` | `_anonymise`, all `check_*` functions, all `clean_*` functions, FK hash consistency |
+| `tests/test_warehouse.py` | `_crc32_sk`, all dimension builders, `build_fato_pedidos` grain and year/month correctness |
 
 ---
 
@@ -223,8 +231,11 @@ data-pipeline-project/
 │   └── hql_queries.hql          # HiveQL equivalents
 ├── tests/
 │   ├── conftest.py              # Session-scoped fixtures with HMAC-hashed IDs
-│   └── test_quality.py          # Unit + property-based (Hypothesis) tests
+│   ├── test_quality.py          # Quality checks + transformation unit/property tests
+│   └── test_warehouse.py        # Dimensional model unit/property tests + regressions
 ├── Makefile
+├── pyproject.toml               # Project metadata, pytest config, ruff config
+├── .python-version              # Pins Python 3.11
 ├── .env.example
 ├── .gitignore
 └── requirements.txt

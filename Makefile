@@ -1,32 +1,32 @@
 .PHONY: install run test clean help
 
-# ── Variables ──────────────────────────────────────────────────────────────
-PYTHON  := python
-PYTEST  := pytest
-VENV    := .venv
-PIP     := $(VENV)/bin/pip || pip
+PYTHON := python3
+VENV   := .venv
 
 # ── Targets ────────────────────────────────────────────────────────────────
 
 help:
 	@echo ""
-	@echo "  install   Install all dependencies"
+	@echo "  install   Create venv and install all dependencies"
 	@echo "  run       Execute the full pipeline"
 	@echo "  test      Run the test suite"
 	@echo "  clean     Remove generated artifacts (__pycache__, .pytest_cache)"
 	@echo ""
 
 install:
-	$(PYTHON) -m pip install --upgrade pip
-	$(PYTHON) -m pip install -r requirements.txt
+	$(PYTHON) -m venv $(VENV)
+	$(VENV)/bin/pip install --upgrade pip
+	$(VENV)/bin/pip install -r requirements.txt
+	@echo ""
+	@echo "Done. Activate with: source $(VENV)/bin/activate"
 
 run:
 	$(PYTHON) pipeline/run_all.py
 
 test:
-	$(PYTEST) tests/ -v --tb=short
+	$(PYTHON) -m pytest tests/ -v --tb=short
 
 clean:
 	find . -type d -name "__pycache__" -not -path "./.git/*" -exec rm -rf {} + 2>/dev/null || true
-	find . -name "*.pyc" -delete 2>/dev/null || true
-	rm -rf .pytest_cache .mypy_cache || true
+	find . -name "*.pyc" -not -path "./.git/*" -delete 2>/dev/null || true
+	rm -rf .pytest_cache .mypy_cache 2>/dev/null || true
